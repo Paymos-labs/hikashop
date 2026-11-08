@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<extension type="plugin" group="hikashoppayment" method="upgrade">
+    <name>Payment - Paymos for HikaShop</name>
+    <version>1.0.0</version>
+    <creationDate>2026-11-08</creationDate>
+    <author>Paymos Labs</author>
+    <authorEmail>support@paymos.io</authorEmail>
+    <authorUrl>https://paymos.io</authorUrl>
+    <copyright>Copyright (c) 2026 Paymos Labs</copyright>
+    <license>GPL-2.0-or-later</license>
+    <description>PLG_HIKASHOPPAYMENT_PAYMOS_XML_DESCRIPTION</description>
+
+    <scriptfile>script.php</scriptfile>
+    <files>
+        <filename plugin="paymos">paymos.php</filename>
+        <filename>paymos_end.php</filename>
+        <filename>LICENSE</filename>
+        <folder>src</folder>
+        <folder>sql</folder>
+        <folder>language</folder>
+        <folder>vendor</folder>
+    </files>
+    <media folder="media" destination="plg_hikashoppayment_paymos">
+        <filename>admin.js</filename>
+    </media>
+
+    <install>
+        <sql>
+            <file driver="mysql" charset="utf8">sql/install.mysql.utf8.sql</file>
+        </sql>
+    </install>
+    <uninstall>
+        <sql>
+            <file driver="mysql" charset="utf8">sql/uninstall.mysql.utf8.sql</file>
+        </sql>
+    </uninstall>
+
+    <updateservers>
+        <server type="extension" priority="1" name="Paymos for HikaShop">https://github.com/Paymos-labs/hikashop/releases/latest/download/update.xml</server>
+    </updateservers>
+</extension>

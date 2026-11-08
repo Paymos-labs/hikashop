@@ -1,0 +1,14 @@
+Payment - Paymos for HikaShop
+Copyright (c) 2026 Paymos Labs
+
+The Joomla payment plugin is distributed under the GNU General Public
+License, version 2 or later. See LICENSE.
+
+The installation ZIP includes the Paymos PHP SDK, Copyright (c) 2026
+Paymos Labs, distributed under the MIT License. See the full license in
+vendor/paymos/php-sdk/LICENSE and the bundled version and source revision
+in vendor/paymos/php-sdk/bundle-manifest.json.
+
+The package builder adds human-readable license comments to the PHP
+files in its staging copy. The source files and program logic stay intact.
+The bundle manifest hashes the staged SDK files shipped in the ZIP.

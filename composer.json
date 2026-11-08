@@ -1,0 +1,28 @@
+{
+  "name": "paymos/hikashop-paymos",
+  "description": "Paymos hosted payments for HikaShop on Joomla",
+  "type": "joomla-plugin",
+  "license": "GPL-2.0-or-later",
+  "homepage": "https://paymos.io",
+  "require": {
+    "php": ">=8.3",
+    "paymos/php-sdk": "^1.9.1"
+  },
+  "require-dev": {
+    "joomla/database": "^3.4 || ^4.0",
+    "phpunit/phpunit": "^11.5"
+  },
+  "autoload": {
+    "psr-4": {
+      "PaymosHikaShop\\": "src/"
+    }
+  },
+  "autoload-dev": {
+    "psr-4": {
+      "PaymosHikaShop\\Tests\\": "tests/"
+    }
+  },
+  "scripts": {
+    "test": "phpunit"
+  }
+}
