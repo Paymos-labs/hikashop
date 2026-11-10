@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-10
+
+- chore: bundle Paymos PHP SDK v1.10.0
+- chore: rebuild canonical CMS package
+
 ## [1.0.1] - 2026-11-08
 
 - chore: rebuild canonical CMS package
