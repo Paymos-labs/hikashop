@@ -1,6 +1,6 @@
 {
   "source_repository": "Paymos-labs/paymos",
   "source_path": "plugins/hikashop-paymos",
-  "source_commit": "6729b2fe8d3bdb9b284e04f6be100f737949f575",
-  "version": "1.0.9"
+  "source_commit": "5eb9951d260f6739f795c981787af8689b86395a",
+  "version": "1.0.10"
 }
