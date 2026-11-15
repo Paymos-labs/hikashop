@@ -11,6 +11,7 @@ use Closure;
 use DateTimeImmutable;
 use Paymos\Client;
 use Paymos\ClientConfig;
+use Paymos\Exception\ApiException;
 use Paymos\Plugin\AmountGuard;
 use Paymos\Plugin\CredentialSet;
 use Paymos\Plugin\NativeProjectionResult;
@@ -117,7 +118,8 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                 $keys = $this->connect->credentials($methodId)[$snapshot['attempt']['environment']] ?? [];
                 if ($this->supportsNewRefunds($keys) && $keys['project_id'] === $snapshot['attempt']['project_id']) {
                     $options['allow_full'] = $this->refunds->nativeRefundStatusAvailable();
-                    $options['allow_overpayment'] = $snapshot['attempt']['status'] === 'paid_over';
+                    $options['allow_overpayment'] = $snapshot['attempt']['status'] === 'paid_over'
+                        && !$this->hasCompletedOverpayment($paymentKey);
                 }
 
                 return $options;
@@ -232,7 +234,11 @@ final class RefundAdapter implements NativeRefundProjectorInterface
             ]);
             $reason = $this->preflight($intent);
             if ($reason !== null) {
-                throw new \RuntimeException($reason);
+                throw new \RuntimeException(
+                    $reason === NativeRefundProjectorInterface::PREFLIGHT_RETRY
+                        ? 'refund_preflight_unavailable'
+                        : $reason
+                );
             }
             $intent = $this->refunds->createIntent($intent);
         }
@@ -262,14 +268,33 @@ final class RefundAdapter implements NativeRefundProjectorInterface
                 return 'refund_reconnect_required';
             }
             $snapshot = $this->newProjectionSnapshot($intent, false);
-            $invoice = $this->client($keys, $intent->environment())->invoices()->get($intent->invoiceId());
+            try {
+                $invoice = $this->client($keys, $intent->environment())->invoices()->get($intent->invoiceId());
+            } catch (ApiException $error) {
+                if ($error->statusCode() === 429 || $error->statusCode() >= 500) {
+                    return NativeRefundProjectorInterface::PREFLIGHT_RETRY;
+                }
+
+                return $error->errorCode() !== '' ? $error->errorCode() : $error->getMessage();
+            } catch (\RuntimeException) {
+                return NativeRefundProjectorInterface::PREFLIGHT_RETRY;
+            }
             $this->store->assertOrderLock(RefundStore::orderId($intent->paymentKey()));
             if (!$this->matchesApiInvoice($invoice, $snapshot['attempt'])) {
                 return 'refund_invoice_snapshot_conflict';
             }
             $snapshot = $this->newProjectionSnapshot($intent, false);
+            if (array_key_exists('refund_summary', $invoice)) {
+                $summary = is_array($invoice['refund_summary']) ? $invoice['refund_summary'] : [];
+                $field = $intent->mode() === RefundStates::FULL ? 'can_refund_full' : 'can_refund_overpayment';
+                if (($summary[$field] ?? false) !== true) {
+                    return 'refund_server_action_unavailable';
+                }
+            }
             if ($intent->mode() === RefundStates::OVERPAYMENT
-                && ($snapshot['attempt']['status'] !== 'paid_over' || $invoice['status'] !== 'paid_over')) {
+                && ($snapshot['attempt']['status'] !== 'paid_over'
+                    || $invoice['status'] !== 'paid_over'
+                    || $this->hasCompletedOverpayment($intent->paymentKey()))) {
                 return 'refund_server_action_unavailable';
             }
 
@@ -461,7 +486,18 @@ final class RefundAdapter implements NativeRefundProjectorInterface
     private function supportsNewRefunds(array $keys): bool
     {
         return CredentialSet::hasCapability($keys, 'invoice_refunds_v1')
-            && ($keys['refund_contract_version'] ?? null) === 1 && CredentialSet::refundsEnabled($keys);
+            && ($keys['refund_contract_version'] ?? null) === 1;
+    }
+
+    private function hasCompletedOverpayment(string $paymentKey): bool
+    {
+        foreach ($this->refunds->forPayment($paymentKey) as $prior) {
+            if ($prior->cashState() === RefundStates::COMPLETED && $prior->mode() === RefundStates::OVERPAYMENT) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function keys(RefundIntent $intent): array

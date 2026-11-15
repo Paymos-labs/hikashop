@@ -14,9 +14,14 @@ use Paymos\ClientConfig;
 use Paymos\Http\HttpResponse;
 use Paymos\Http\TransportInterface;
 use Paymos\Plugin\AesGcmEnvelope;
+use Paymos\Plugin\NativeRefundProjectorInterface;
+use Paymos\Plugin\RefundCoordinator;
+use Paymos\Plugin\RefundIntent;
+use Paymos\Plugin\RefundStates;
 use Paymos\Webhook\WebhookEvent;
 use PaymosHikaShop\ConnectAdmin;
 use PaymosHikaShop\RefundAdapter;
+use PaymosHikaShop\RefundStore;
 use PaymosHikaShop\Store;
 use PHPUnit\Framework\Attributes\TestWith;
 use PHPUnit\Framework\TestCase;
@@ -312,7 +317,153 @@ final class RefundFlowTest extends TestCase
         self::assertCount(1, $fixture->posts);
     }
 
+    public function testComposerManifestRequiresPaymosPhpSdkOneTen(): void
+    {
+        $composer = json_decode((string) file_get_contents(dirname(__DIR__) . '/composer.json'), true, 64, JSON_THROW_ON_ERROR);
+        self::assertSame('^1.10.0', $composer['require']['paymos/php-sdk'] ?? null);
+        self::assertSame('refund_preflight_retry', NativeRefundProjectorInterface::PREFLIGHT_RETRY);
+    }
+
+    public function testDisabledRefundsSnapshotAllowsPanelPreflightAndSubmitWhenContractValid(): void
+    {
+        [$adapter, $fixture] = $this->scenario('paid_over');
+        $fixture->setCredentials(false, 1);
+
+        $panel = $adapter->panel(17, 42);
+        self::assertTrue($panel['allow_full']);
+        self::assertTrue($panel['allow_overpayment']);
+
+        $pending = $this->submit($adapter, 'overpayment');
+        self::assertSame('pending', $pending['status']);
+        self::assertCount(1, $fixture->posts);
+
+        [$adapterMissingContract, $fixtureMissingContract] = $this->scenario();
+        $fixtureMissingContract->setCredentials(true, null);
+        self::assertFalse($adapterMissingContract->panel(17, 42)['allow_full']);
+        $this->reject('refund_reconnect_required', fn () => $this->submit($adapterMissingContract, 'full'));
+        self::assertSame([], $fixtureMissingContract->requests);
+    }
+
+    public function testPreflightReturnsRetryOnTransientInvoiceErrorsAndMapsPreCreateToUnavailable(): void
+    {
+        [$adapter, $fixture] = $this->scenario();
+        $fixture->invoiceResponse = new HttpResponse(429, '{"code":"rate_limited"}', ['Content-Type' => 'application/problem+json']);
+        $this->reject('refund_preflight_unavailable', fn () => $this->submit($adapter, 'full', self::TOKEN));
+        self::assertSame([], $fixture->intents);
+
+        $fixture->invoiceResponse = new HttpResponse(502, '{"code":"bad_gateway"}', ['Content-Type' => 'application/problem+json']);
+        $this->reject('refund_preflight_unavailable', fn () => $this->submit($adapter, 'full', self::TOKEN));
+        self::assertSame([], $fixture->intents);
+
+        $fixture->invoiceResponse = null;
+        $fixture->loseNextInvoiceGet = true;
+        $this->reject('refund_preflight_unavailable', fn () => $this->submit($adapter, 'full', self::TOKEN));
+        self::assertSame([], $fixture->intents);
+
+        $fixture->invoiceResponse = new HttpResponse(404, json_encode([
+            'type' => 'https://paymos.io/docs/errors/codes#invoice_not_found',
+            'title' => 'Not Found',
+            'status' => 404,
+            'detail' => 'Invoice not found.',
+            'code' => 'invoice_not_found',
+        ], JSON_THROW_ON_ERROR), ['Content-Type' => 'application/problem+json']);
+        $this->reject('invoice_not_found', fn () => $this->submit($adapter, 'full', self::TOKEN));
+        self::assertSame([], $fixture->intents);
+
+        [$coordAdapter, $coordFixture, $refunds, $connect, $clientFactory, $store] = $this->scenarioWithInternals('paid_over');
+        $operationId = RefundStore::operationId();
+        $coordFixture->now = new DateTimeImmutable('2026-11-07T14:00:00.000000+00:00');
+        $intent = new RefundIntent([
+            'operation_id' => $operationId,
+            'installation_id' => $store->installationId(),
+            'request_token' => self::TOKEN,
+            'platform' => 'hikashop',
+            'native_payment_key' => 'hikashop:42',
+            'method_id' => 17,
+            'native_snapshot' => ['amount_decimal' => '12.34', 'currency' => 'EUR', 'order_status' => 'confirmed'],
+            'invoice_id' => 'inv_fixture',
+            'project_id' => 'prj_fixture',
+            'environment' => 'sandbox',
+            'mode' => RefundStates::OVERPAYMENT,
+            'full_draft' => null,
+        ]);
+
+        $refunds->withPaymentLock('hikashop:42', function () use ($coordAdapter, $coordFixture, $refunds, $connect, $clientFactory, $intent): void {
+            $saved = $refunds->createIntent($intent);
+            $coordFixture->invoiceResponse = new HttpResponse(404, json_encode([
+                'type' => 'https://paymos.io/docs/errors/codes#invoice_not_found',
+                'title' => 'Not Found',
+                'status' => 404,
+                'detail' => 'Invoice not found.',
+                'code' => 'invoice_not_found',
+            ], JSON_THROW_ON_ERROR), ['Content-Type' => 'application/problem+json']);
+            self::assertSame('invoice_not_found', $coordAdapter->preflight($saved));
+
+            $coordFixture->invoiceResponse = new HttpResponse(429, '{"code":"rate_limited"}', []);
+            self::assertSame(NativeRefundProjectorInterface::PREFLIGHT_RETRY, $coordAdapter->preflight($saved));
+
+            $coordFixture->invoiceResponse = new HttpResponse(503, '{"code":"unavailable"}', []);
+            self::assertSame(NativeRefundProjectorInterface::PREFLIGHT_RETRY, $coordAdapter->preflight($saved));
+
+            $coordFixture->invoiceResponse = null;
+            $coordFixture->loseNextInvoiceGet = true;
+            self::assertSame(NativeRefundProjectorInterface::PREFLIGHT_RETRY, $coordAdapter->preflight($saved));
+
+            $coordFixture->invoiceResponse = new HttpResponse(429, '{"code":"rate_limited"}', []);
+            $keys = $connect->credentials(17)['sandbox'];
+            $coordinator = new RefundCoordinator($clientFactory($keys), $refunds, $coordAdapter, static fn (): DateTimeImmutable => $coordFixture->now);
+            $coordinator->submit($saved->operationId());
+
+            $retryPending = $refunds->getIntent($saved->operationId());
+            self::assertSame(RefundStates::NOT_SUBMITTED, $retryPending->cashState());
+            self::assertSame(NativeRefundProjectorInterface::PREFLIGHT_RETRY, $retryPending->toArray()['review_reason']);
+            self::assertSame([], $coordFixture->posts);
+
+            $coordFixture->invoiceResponse = null;
+            $coordinator->submit($saved->operationId());
+            $submitted = $refunds->getIntent($saved->operationId());
+            self::assertSame(RefundStates::CREATED, $submitted->cashState());
+            self::assertCount(1, $coordFixture->posts);
+        });
+    }
+
+    public function testMissingRefundSummaryAllowsRefundsAndSuppressesCompletedOverpayment(): void
+    {
+        [$adapter, $fixture] = $this->scenario('paid_over');
+        $panel = $adapter->panel(17, 42);
+        self::assertTrue($panel['allow_overpayment']);
+        self::assertTrue($panel['allow_full']);
+
+        $pending = $this->submit($adapter, 'overpayment');
+        $fixture->refundStatus = 'completed';
+        $completed = $adapter->adminAction('reconcile', 17, 42, ['operation_id' => $pending['operation_id']]);
+        self::assertSame('completed', $completed['status']);
+
+        $afterPanel = $adapter->panel(17, 42);
+        self::assertFalse($afterPanel['allow_overpayment']);
+        self::assertTrue($afterPanel['allow_full']);
+
+        $this->reject('refund_server_action_unavailable', fn () => $this->submit($adapter, 'overpayment', self::OTHER_TOKEN));
+        self::assertCount(1, $fixture->posts);
+
+        $fixture->refundSummary = ['can_refund_full' => false, 'can_refund_overpayment' => false];
+        $this->reject('refund_server_action_unavailable', fn () => $this->submit($adapter, 'full', self::OTHER_TOKEN));
+        self::assertCount(1, $fixture->posts);
+
+        $fixture->refundSummary = null;
+        $fixture->refundStatus = 'created';
+        $fullPending = $this->submit($adapter, 'full', self::OTHER_TOKEN);
+        self::assertSame('pending', $fullPending['status']);
+        self::assertCount(2, $fixture->posts);
+    }
+
     private function scenario(string $invoiceStatus = 'paid'): array
+    {
+        [$adapter, $fixture] = $this->scenarioWithInternals($invoiceStatus);
+        return [$adapter, $fixture];
+    }
+
+    private function scenarioWithInternals(string $invoiceStatus = 'paid'): array
     {
         $fixture = new RefundFlowFixture($invoiceStatus);
         $db = $this->getMockBuilder(MysqliDriver::class)->disableOriginalConstructor()->onlyMethods([
@@ -340,10 +491,11 @@ final class RefundFlowTest extends TestCase
         $store = new Store($db);
         $connect = new ConnectAdmin($store, RefundFlowFixture::SITE, RefundFlowFixture::SECRET);
         $clock = static fn (): DateTimeImmutable => $fixture->now;
-        $adapter = new RefundAdapter($store, $connect, $fixture->project(...),
-            static fn (array $keys): Client => new Client(new ClientConfig($keys['api_key'], $keys['api_secret']), $fixture), $clock);
+        $refunds = new RefundStore($store, $clock);
+        $clientFactory = static fn (array $keys): Client => new Client(new ClientConfig($keys['api_key'], $keys['api_secret']), $fixture);
+        $adapter = new RefundAdapter($store, $connect, $fixture->project(...), $clientFactory, $clock);
 
-        return [$adapter, $fixture];
+        return [$adapter, $fixture, $refunds, $connect, $clientFactory, $store];
     }
 
     private function submit(RefundAdapter $adapter, string $mode, string $token = self::TOKEN): array
@@ -394,8 +546,11 @@ final class RefundFlowFixture implements TransportInterface
     public int $nativeWrites = 0;
     public bool $loseNextPost = false;
     public bool $loseNextGet = false;
+    public bool $loseNextInvoiceGet = false;
     public bool $failNativeWrite = false;
     public bool $refundWindowExpired = false;
+    public ?HttpResponse $invoiceResponse = null;
+    public ?array $refundSummary = null;
 
     private ?array $transaction = null;
     private string $credentials;
@@ -423,12 +578,17 @@ final class RefundFlowFixture implements TransportInterface
 
     public function setRefundsEnabled(bool $enabled): void
     {
+        $this->setCredentials($enabled, $enabled ? 1 : null);
+    }
+
+    public function setCredentials(bool $refundsEnabled, ?int $contractVersion = 1, array $capabilities = ['invoice_refunds_v1']): void
+    {
         $environments = [];
         foreach (['sandbox' => 'test', 'live' => 'live'] as $environment => $prefix) {
             $environments[$environment] = [
                 'api_key' => "pk_{$prefix}_fixture", 'api_secret' => "sk_{$prefix}_fixture", 'project_id' => 'prj_fixture',
-                'webhook_secret' => "whsec_{$prefix}_fixture", 'capabilities' => ['invoice_refunds_v1'],
-                'refund_contract_version' => $enabled ? 1 : null, 'refunds_enabled' => $enabled,
+                'webhook_secret' => "whsec_{$prefix}_fixture", 'capabilities' => $capabilities,
+                'refund_contract_version' => $contractVersion, 'refunds_enabled' => $refundsEnabled,
             ];
         }
         $this->credentials = AesGcmEnvelope::seal(['plugin' => 'hikashop', 'source_url' => self::SITE, 'environments' => $environments],
@@ -437,7 +597,7 @@ final class RefundFlowFixture implements TransportInterface
 
     public function payload(): array
     {
-        $intent = reset($this->intents);
+        $intent = end($this->intents);
         return json_decode($intent['payload'], true, 64, JSON_THROW_ON_ERROR);
     }
 
@@ -482,32 +642,53 @@ final class RefundFlowFixture implements TransportInterface
                     'status' => 409, 'detail' => 'The invoice refund window has closed.', 'code' => 'refund_window_expired',
                 ], JSON_THROW_ON_ERROR), ['Content-Type' => 'application/problem+json']);
             }
-            $this->withdrawals[$request['external_order_id']] = 'wd_fixture';
+            $withdrawalId = $this->withdrawals[$request['external_order_id']]
+                ?? ($this->withdrawals === [] ? 'wd_fixture' : 'wd_fixture_' . (count($this->withdrawals) + 1));
+            $this->withdrawals[$request['external_order_id']] = $withdrawalId;
             if ($this->loseNextPost) {
                 $this->loseNextPost = false;
                 throw new \RuntimeException('fixture lost POST response');
             }
 
-            return self::response(['withdrawal_id' => 'wd_fixture']);
+            return self::response(['withdrawal_id' => $withdrawalId]);
         }
-        if ($method === 'GET' && $path === '/v1/refunds/wd_fixture') {
+        if ($method === 'GET' && preg_match('~\A/v1/refunds/(wd_fixture(?:_[0-9]+)?)\z~', (string) $path, $matches) === 1) {
             if ($this->loseNextGet) {
                 $this->loseNextGet = false;
                 throw new \RuntimeException('fixture lost GET response');
             }
 
-            $request = $this->posts[0];
-            return self::response($request + ['withdrawal_id' => 'wd_fixture', 'project_id' => 'prj_fixture',
+            $withdrawalId = $matches[1];
+            $request = null;
+            foreach ($this->posts as $candidate) {
+                if (($this->withdrawals[$candidate['external_order_id']] ?? null) === $withdrawalId) {
+                    $request = $candidate;
+                }
+            }
+            $request ??= end($this->posts);
+            return self::response($request + ['withdrawal_id' => $withdrawalId, 'project_id' => 'prj_fixture',
                 'status' => $this->refundStatus, 'amount' => $request['mode'] === 'overpayment' ? '1.1' : '7.5',
                 'is_test' => true, 'currency' => 'USDT', 'network' => 'TRON',
                 'first_sender' => self::RECIPIENT, 'destination_address' => self::RECIPIENT]);
         }
         if ($method === 'GET' && $path === '/v1/invoices/' . self::INVOICE) {
-            return self::response(['invoice_id' => self::INVOICE, 'project_id' => $this->invoiceProject,
+            if ($this->loseNextInvoiceGet) {
+                $this->loseNextInvoiceGet = false;
+                throw new \RuntimeException('fixture lost invoice GET response');
+            }
+            if ($this->invoiceResponse !== null) {
+                return $this->invoiceResponse;
+            }
+            $invoice = ['invoice_id' => self::INVOICE, 'project_id' => $this->invoiceProject,
                 'is_test' => true, 'is_final' => true, 'status' => $this->invoiceStatus,
                 'order' => ['external_id' => self::INVOICE_ORDER, 'amount' => '12.34', 'currency' => 'EUR'],
                 'payment' => ['currency' => 'USDT', 'network' => 'TRON', 'chain_id' => 728126428,
-                    'expected' => '7.5', 'paid' => $this->invoiceStatus === 'paid_over' ? '8.6' : '7.5', 'remaining' => '0']]);
+                    'expected' => '7.5', 'paid' => $this->invoiceStatus === 'paid_over' ? '8.6' : '7.5', 'remaining' => '0']];
+            if ($this->refundSummary !== null) {
+                $invoice['refund_summary'] = $this->refundSummary;
+            }
+
+            return self::response($invoice);
         }
 
         throw new \LogicException('Unexpected mock Paymos request: ' . $method . ' ' . $path);

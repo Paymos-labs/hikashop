@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [1.0.12] - 2026-11-15
+
+- fix(refunds): decouple refund RBAC from Withdraw and unify 12 CMS refund adapters
+- chore: rebuild canonical CMS package
+
 ## [1.0.11] - 2026-11-14
 
 - chore: rebuild canonical CMS package
