@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS `#__hikashop_paymos_attempt` (
     `payment_url` TEXT NULL,
     `status` VARCHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL DEFAULT 'creating',
     `review_reason` VARCHAR(128) CHARACTER SET ascii COLLATE ascii_bin NULL,
+    `products_json` LONGTEXT NULL,
     PRIMARY KEY (`order_id`, `generation`),
     UNIQUE KEY `external_order` (`external_order_id`),
     UNIQUE KEY `invoice` (`invoice_id`)

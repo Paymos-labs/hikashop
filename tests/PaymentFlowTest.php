@@ -636,6 +636,347 @@ final class PaymentFlowTest extends TestCase
         self::assertSame('created', $fixture->order['order_status']);
     }
 
+    public function testSingleProductLineItemSendsProductsAndOmitsMissingDescription(): void
+    {
+        [$payments, $fixture, $transport] = $this->scenario();
+        $fixture->order['order_full_price'] = '47.00000';
+        $fixture->orderProducts = [[
+            'order_product_id' => '1',
+            'product_id' => '10',
+            'order_product_name' => '<b>Studio</b> &amp; Pro',
+            'order_product_quantity' => '2',
+            'order_product_price' => '24.50000',
+        ]];
+        $fixture->products = [[
+            'product_id' => '10',
+            'product_parent_id' => '0',
+            'product_description' => '<p>Line 1</p><p>Line 2</p>',
+        ]];
+        $fixture->respond($transport, 'awaiting_client');
+
+        self::assertSame('https://checkout.paymos.io/invoice/inv_fixture_1', $payments->start(42, 17));
+        $body = $transport->requests[0]['body'];
+        self::assertSame('47', $body['amount']);
+        self::assertSame('EUR', $body['currency']);
+        self::assertSame([[
+            'title' => 'Studio & Pro',
+            'quantity' => 2,
+            'unit_amount' => '24.5',
+            'description' => "Line 1\nLine 2",
+        ]], $body['products']);
+        self::assertSame($body['products'], Store::decodeProductsJson($fixture->attempts[1]['products_json']));
+
+        [$minimalPayments, $minimalFixture, $minimalTransport] = $this->scenario();
+        $minimalFixture->order['order_full_price'] = '12.00000';
+        $minimalFixture->orderProducts = [[
+            'order_product_id' => '1',
+            'product_id' => '20',
+            'order_product_name' => 'Priority Support',
+            'order_product_quantity' => '1',
+            'order_product_price' => '12.00000',
+        ]];
+        $minimalFixture->products = [[
+            'product_id' => '20',
+            'product_parent_id' => '0',
+            'product_description' => '<p>&nbsp;</p>',
+        ]];
+        $minimalFixture->respond($minimalTransport, 'awaiting_client');
+
+        $minimalPayments->start(42, 17);
+        self::assertSame([[
+            'title' => 'Priority Support',
+            'quantity' => 1,
+            'unit_amount' => '12',
+        ]], $minimalTransport->requests[0]['body']['products']);
+    }
+
+    public function testMultiItemCartIncludesVariantsAndPreservesNativeOrderTotal(): void
+    {
+        [$payments, $fixture, $transport] = $this->scenario();
+        $fixture->order['order_full_price'] = '49.50000';
+        $fixture->orderProducts = [
+            [
+                'order_product_id' => '1',
+                'product_id' => '105',
+                'order_product_name' => 'Canvas · Blue',
+                'order_product_quantity' => '2',
+                'order_product_price' => '15.00000',
+            ],
+            [
+                'order_product_id' => '2',
+                'product_id' => '200',
+                'order_product_name' => 'Notebook',
+                'order_product_quantity' => '1',
+                'order_product_price' => '12.50000',
+            ],
+            [
+                'order_product_id' => '3',
+                'product_id' => '0',
+                'order_product_name' => 'Gift Wrap',
+                'order_product_quantity' => '1',
+                'order_product_price' => '0.00000',
+            ],
+        ];
+        $fixture->products = [
+            ['product_id' => '105', 'product_parent_id' => '100', 'product_description' => ''],
+            ['product_id' => '100', 'product_parent_id' => '0', 'product_description' => '<p>Giclée print</p>'],
+        ];
+        $fixture->respond($transport, 'awaiting_client');
+
+        $payments->start(42, 17);
+        $body = $transport->requests[0]['body'];
+        self::assertSame('49.5', $body['amount']);
+        self::assertSame([
+            [
+                'title' => 'Canvas · Blue',
+                'quantity' => 2,
+                'unit_amount' => '15',
+                'description' => 'Giclée print',
+            ],
+            [
+                'title' => 'Notebook',
+                'quantity' => 1,
+                'unit_amount' => '12.5',
+            ],
+            [
+                'title' => 'Gift Wrap',
+                'quantity' => 1,
+                'unit_amount' => '0',
+            ],
+        ], $body['products']);
+
+        [$fiftyPayments, $fiftyFixture, $fiftyTransport] = $this->scenario();
+        $fiftyFixture->order['order_full_price'] = '50.00000';
+        for ($i = 1; $i <= 50; $i++) {
+            $fiftyFixture->orderProducts[] = [
+                'order_product_id' => (string) $i,
+                'product_id' => '0',
+                'order_product_name' => 'Item ' . $i,
+                'order_product_quantity' => '1',
+                'order_product_price' => '1.00000',
+            ];
+        }
+        $fiftyFixture->respond($fiftyTransport, 'awaiting_client');
+        $fiftyPayments->start(42, 17);
+        self::assertCount(50, $fiftyTransport->requests[0]['body']['products']);
+    }
+
+    #[DataProvider('invalidProductLineCases')]
+    public function testInvalidLineItemOrOverFiftyItemsFallsBackAllOrNothingToAmountOnly(array $orderProducts): void
+    {
+        [$payments, $fixture, $transport] = $this->scenario();
+        $fixture->order['order_full_price'] = '42.50000';
+        $fixture->orderProducts = $orderProducts;
+        $fixture->respond($transport, 'awaiting_client');
+
+        $payments->start(42, 17);
+        $body = $transport->requests[0]['body'];
+        self::assertSame('42.5', $body['amount']);
+        self::assertSame('EUR', $body['currency']);
+        self::assertArrayNotHasKey('products', $body);
+        self::assertNull($fixture->attempts[1]['products_json']);
+    }
+
+    public static function invalidProductLineCases(): iterable
+    {
+        $valid = [
+            'order_product_id' => '1',
+            'product_id' => '0',
+            'order_product_name' => 'Valid Item',
+            'order_product_quantity' => '1',
+            'order_product_price' => '20.00000',
+        ];
+        yield 'fractional quantity' => [[$valid, [
+            'order_product_id' => '2', 'product_id' => '0', 'order_product_name' => 'Fabric',
+            'order_product_quantity' => '1.5', 'order_product_price' => '10.00000',
+        ]]];
+        yield 'zero quantity' => [[$valid, [
+            'order_product_id' => '2', 'product_id' => '0', 'order_product_name' => 'Zero Qty',
+            'order_product_quantity' => '0', 'order_product_price' => '10.00000',
+        ]]];
+        yield 'negative unit price' => [[$valid, [
+            'order_product_id' => '2', 'product_id' => '0', 'order_product_name' => 'Negative Price',
+            'order_product_quantity' => '1', 'order_product_price' => '-5.00000',
+        ]]];
+        yield 'blank title' => [[$valid, [
+            'order_product_id' => '2', 'product_id' => '0', 'order_product_name' => '<b>&nbsp;</b>',
+            'order_product_quantity' => '1', 'order_product_price' => '10.00000',
+        ]]];
+        $fiftyOne = [];
+        for ($i = 1; $i <= 51; $i++) {
+            $fiftyOne[] = [
+                'order_product_id' => (string) $i, 'product_id' => '0', 'order_product_name' => 'Item ' . $i,
+                'order_product_quantity' => '1', 'order_product_price' => '1.00000',
+            ];
+        }
+        yield '51 items' => [$fiftyOne];
+    }
+
+    public function testTimeoutRetryReplaysByteIdenticalProductsPayloadWhenStoreProductsChange(): void
+    {
+        [$payments, $fixture, $transport] = $this->scenario();
+        $fixture->order['order_full_price'] = '49.00000';
+        $fixture->orderProducts = [
+            [
+                'order_product_id' => '1',
+                'product_id' => '10',
+                'order_product_name' => 'Canvas "Pro" (v2) \\ Edition €',
+                'order_product_quantity' => '2',
+                'order_product_price' => '20.00000',
+            ],
+            [
+                'order_product_id' => '2',
+                'product_id' => '20',
+                'order_product_name' => "Priority 'Support'",
+                'order_product_quantity' => '1',
+                'order_product_price' => '9.00000',
+            ],
+        ];
+        $fixture->products = [
+            ['product_id' => '10', 'product_parent_id' => '0', 'product_description' => "<p>Line 1</p><p>Line 2 'quoted' \\ €</p>"],
+        ];
+
+        $transport->queue(function () use ($fixture): never {
+            self::assertNotNull($fixture->attempts[1]['products_json']);
+            self::assertNull($fixture->attempts[1]['invoice_id']);
+            throw new \RuntimeException('fixture timeout');
+        });
+        $this->assertFailure('fixture timeout', fn () => $payments->start(42, 17));
+
+        // Mutate order lines and product description in store DB before retry.
+        $fixture->orderProducts = [[
+            'order_product_id' => '1',
+            'product_id' => '10',
+            'order_product_name' => 'Mutated Product',
+            'order_product_quantity' => '9',
+            'order_product_price' => '99.00000',
+        ]];
+        $fixture->products = [
+            ['product_id' => '10', 'product_parent_id' => '0', 'product_description' => 'Mutated description'],
+        ];
+
+        // Financial change while creating must still fail closed with paymos_attempt_open.
+        $fixture->order['order_full_price'] = '50.00000';
+        $this->assertFailure('paymos_attempt_open', fn () => $payments->start(42, 17));
+        $fixture->order['order_full_price'] = '49.00000';
+
+        $fixture->respond($transport, 'awaiting_client');
+        $url = $payments->start(42, 17);
+        self::assertSame('https://checkout.paymos.io/invoice/inv_fixture_1', $url);
+        self::assertCount(2, $transport->requests);
+        self::assertSame($transport->requests[0]['rawBody'], $transport->requests[1]['rawBody']);
+        self::assertSame([
+            [
+                'title' => 'Canvas "Pro" (v2) \\ Edition €',
+                'quantity' => 2,
+                'unit_amount' => '20',
+                'description' => "Line 1\nLine 2 'quoted' \\ €",
+            ],
+            [
+                'title' => "Priority 'Support'",
+                'quantity' => 1,
+                'unit_amount' => '9',
+            ],
+        ], $transport->requests[1]['body']['products']);
+
+        // Changing order_full_price replaces the open invoice and picks up current store products for generation 2.
+        $fixture->order['order_full_price'] = '99.00000';
+        $fixture->respond($transport, 'awaiting_client');
+        $transport->queue(PaymentTransportFixture::response(['status' => 'cancelled']));
+        $fixture->respond($transport, 'awaiting_client', 2);
+        self::assertSame('https://checkout.paymos.io/invoice/inv_fixture_2', $payments->start(42, 17));
+        $gen2Products = [[
+            'title' => 'Mutated Product',
+            'quantity' => 9,
+            'unit_amount' => '99',
+            'description' => 'Mutated description',
+        ]];
+        self::assertSame($gen2Products, $transport->requests[4]['body']['products']);
+
+        // Webhook omits order.products while API reverse read may include it; fulfillment still succeeds once.
+        $fixture->respond($transport, 'paid', 2, [
+            'order' => [
+                'external_id' => $fixture->attempts[2]['external_order_id'],
+                'amount' => '99',
+                'currency' => 'EUR',
+                'products' => $gen2Products,
+            ],
+        ]);
+        $paidData = $fixture->invoice('paid', 2);
+        unset($paidData['payment_url']);
+        $now = time();
+        $rawWebhook = json_encode(['event_id' => 'evt_products_paid', 'event_type' => 'invoice.paid',
+            'version' => 1, 'occurred_at' => $now, 'data' => $paidData], JSON_THROW_ON_ERROR);
+        $sig = 't=' . $now . ',v1=' . hash_hmac('sha256', $now . '.' . $rawWebhook, 'whsec_test_fixture');
+        self::assertSame(200, $payments->webhook($rawWebhook, $sig, $now));
+        self::assertSame('confirmed', $fixture->order['order_status']);
+    }
+
+    public function testLegacyImageSnapshotRetryProjectsOnlyTheRemovedKeyWithoutNativeProductReads(): void
+    {
+        [$payments, $fixture, $transport] = $this->scenario();
+        $products = [
+            [
+                'title' => '  Canvas "Pro" \\ €  ',
+                'description' => "Original\nDescription 'quoted' \\ €",
+                'image_url' => 'https://legacy.example/original.webp',
+                'quantity' => 2,
+                'unit_amount' => '12345678901234567890.123456789012345678',
+            ],
+            ['title' => 'Free Support', 'quantity' => 1, 'unit_amount' => '0.00'],
+        ];
+        $raw = json_encode($products, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        $originalAttempt = [
+            'order_id' => 42, 'generation' => 1, 'method_id' => 17,
+            'environment' => 'sandbox', 'project_id' => 'prj_fixture', 'external_order_id' => 'hikashop_legacy',
+            'amount' => '12.34', 'currency' => 'EUR', 'products_json' => $raw,
+            'invoice_id' => null, 'payment_url' => null, 'status' => 'creating', 'review_reason' => null,
+        ];
+        $fixture->attempts[1] = $originalAttempt;
+        $fixture->orderProducts = [[
+            'order_product_id' => '1', 'product_id' => '10', 'order_product_name' => 'Mutated Product',
+            'order_product_quantity' => '9', 'order_product_price' => '99.00000',
+        ]];
+        $fixture->products = [['product_id' => '10', 'product_parent_id' => '0', 'product_description' => 'Mutated description']];
+
+        $fixture->order['order_full_price'] = '99.00000';
+        $this->assertFailure('paymos_attempt_open', fn () => $payments->start(42, 17));
+        $fixture->order['order_full_price'] = '12.34000';
+        $fixture->mode = 'live';
+        $this->assertFailure('paymos_attempt_open', fn () => $payments->start(42, 17));
+        $fixture->mode = 'sandbox';
+        self::assertCount(0, $transport->requests);
+        self::assertSame($originalAttempt, $fixture->attempts[1]);
+
+        $expected = $products;
+        unset($expected[0]['image_url']);
+        $transport->queue(function (array $request) use ($fixture, $raw, $expected): never {
+            self::assertSame($raw, $fixture->attempts[1]['products_json']);
+            self::assertSame($expected, $request['products']);
+            self::assertSame('12.34', $request['amount']);
+            self::assertSame('EUR', $request['currency']);
+            self::assertSame('hikashop_legacy', $request['external_order_id']);
+            throw new \RuntimeException('fixture timeout');
+        });
+        $this->assertFailure('fixture timeout', fn () => $payments->start(42, 17));
+        self::assertSame($originalAttempt, $fixture->attempts[1]);
+
+        $fixture->respond($transport, 'awaiting_client');
+        self::assertSame('https://checkout.paymos.io/invoice/inv_fixture_1', $payments->start(42, 17));
+        self::assertCount(2, $transport->requests);
+        self::assertSame($transport->requests[0]['rawBody'], $transport->requests[1]['rawBody']);
+        self::assertSame($expected, $transport->requests[1]['body']['products']);
+        self::assertSame($raw, $fixture->attempts[1]['products_json']);
+        self::assertSame('hikashop_legacy', $fixture->attempts[1]['external_order_id']);
+        self::assertCount(1, $fixture->attempts);
+        self::assertSame('created', $fixture->order['order_status']);
+        self::assertSame([], $fixture->history);
+        $queries = implode("\n", $fixture->queries);
+        self::assertStringNotContainsString('hikashop_order_product', $queries);
+        self::assertStringNotContainsString('hikashop_product', $queries);
+        self::assertStringNotContainsString('hikashop_file', $queries);
+    }
+
     private static function minorUnitError(): HttpResponse
     {
         return new HttpResponse(400, json_encode([
@@ -686,7 +1027,7 @@ final class PaymentFlowTest extends TestCase
         $fixture = new PaymentDatabaseFixture($refundContract);
         $db = $this->getMockBuilder(MysqliDriver::class)->disableOriginalConstructor()->onlyMethods([
             'setQuery', 'getMonitor', 'setMonitor', 'getPrefix', 'getConnection', 'quote', 'quoteName',
-            'loadResult', 'loadAssoc', 'execute', 'getAffectedRows',
+            'loadResult', 'loadAssoc', 'loadAssocList', 'execute', 'getAffectedRows',
         ])->getMock();
         $db->method('setQuery')->willReturnCallback(static function ($sql) use ($db, $fixture) {
             $fixture->sql = $sql;
@@ -703,6 +1044,7 @@ final class PaymentFlowTest extends TestCase
         $db->method('quoteName')->willReturnCallback(static fn (string $s): string => chr(96) . $s . chr(96));
         $db->method('loadResult')->willReturnCallback($fixture->query(...));
         $db->method('loadAssoc')->willReturnCallback($fixture->query(...));
+        $db->method('loadAssocList')->willReturnCallback($fixture->query(...));
         $db->method('execute')->willReturnCallback($fixture->query(...));
         $db->method('getAffectedRows')->willReturnCallback(static fn () => $fixture->affected);
 
@@ -740,7 +1082,7 @@ final class PaymentTransportFixture implements TransportInterface
         $decoded = $body === null || $body === '' ? null : json_decode($body, true, 64, JSON_THROW_ON_ERROR);
         preg_match('~\AHMAC-SHA256 ([^:]+):[a-zA-Z0-9+/]+={0,2}\z~', $headers['Authorization'] ?? '', $authorization);
         $this->requests[] = ['method' => $method, 'path' => parse_url($url, PHP_URL_PATH), 'query' => parse_url($url, PHP_URL_QUERY),
-            'key' => $authorization[1] ?? null, 'body' => $decoded];
+            'key' => $authorization[1] ?? null, 'body' => $decoded, 'rawBody' => $body];
         $response = array_shift($this->responses);
         if ($response === null) {
             throw new \LogicException('Unplanned request to the mock Paymos API');
@@ -769,6 +1111,9 @@ final class PaymentDatabaseFixture
     public array $events = [];
     public array $history = [];
     public array $effects = [];
+    public array $orderProducts = [];
+    public array $products = [];
+    public array $queries = [];
     public array $order = [
         'order_id' => 42, 'order_payment_id' => '17', 'order_payment_method' => 'paymos',
         'order_status' => 'created', 'order_full_price' => '12.34000', 'order_currency_id' => 1,
@@ -839,6 +1184,7 @@ final class PaymentDatabaseFixture
     public function query(): mixed
     {
         $sql = $this->sql;
+        $this->queries[] = $sql;
         $this->monitor?->startQuery($sql);
         $this->affected = 0;
         try {
@@ -856,6 +1202,8 @@ final class PaymentDatabaseFixture
                 str_contains($sql, 'hikashop_paymos_event') => $this->event($sql),
                 str_contains($sql, 'hikashop_paymos_effect') => $this->effect($sql),
                 str_starts_with($sql, 'SELECT ') && str_contains($sql, '`#__hikashop_paymos_refund`') => null,
+                str_contains($sql, 'hikashop_order_product') => $this->orderProducts,
+                str_contains($sql, 'hikashop_product') => $this->productsQuery($sql),
                 str_contains($sql, 'hikashop_order') => $this->order,
                 str_contains($sql, 'hikashop_payment') => ['payment_id' => 17, 'payment_type' => 'paymos', 'payment_published' => 1],
                 str_contains($sql, 'hikashop_currency') => 'EUR',
@@ -904,11 +1252,12 @@ final class PaymentDatabaseFixture
             return $this->attempts === [] ? null : end($this->attempts);
         }
         if (str_starts_with($sql, 'INSERT')) {
-            [, $generation, $method, $environment, $project, $externalId, $amount, $currency] = self::insertValues($sql);
+            [, $generation, $method, $environment, $project, $externalId, $amount, $currency, $productsJson] = self::insertValues($sql);
             $this->attempts[(int) $generation] = [
                 'order_id' => 42, 'generation' => $generation, 'method_id' => $method, 'environment' => $environment,
                 'project_id' => $project, 'external_order_id' => $externalId, 'amount' => $amount,
-                'currency' => $currency, 'invoice_id' => null, 'payment_url' => null, 'status' => 'creating', 'review_reason' => null,
+                'currency' => $currency, 'products_json' => $productsJson,
+                'invoice_id' => null, 'payment_url' => null, 'status' => 'creating', 'review_reason' => null,
             ];
             return true;
         }
@@ -991,10 +1340,63 @@ final class PaymentDatabaseFixture
         return count(array_filter($this->history, static fn ($marker) => $marker === $match[1]));
     }
 
+    private function productsQuery(string $sql): array
+    {
+        preg_match('/WHERE product_id IN \(([^)]+)\)/', $sql, $match);
+        $ids = array_map('trim', explode(',', $match[1]));
+        return array_values(array_filter(
+            $this->products,
+            static fn (array $row): bool => in_array((string) $row['product_id'], $ids, true)
+        ));
+    }
+
     private static function insertValues(string $sql): array
     {
-        preg_match('/\bVALUES \(([^)]+)\)/', $sql, $match);
-        return array_map(trim(...), str_getcsv($match[1], ',', "'", ''));
+        $pos = strpos($sql, 'VALUES (');
+        TestCase::assertNotFalse($pos);
+        $len = strlen($sql);
+        $i = $pos + 8;
+        $values = [];
+        while ($i < $len) {
+            while ($i < $len && $sql[$i] === ' ') {
+                $i++;
+            }
+            if ($i >= $len || $sql[$i] === ')') {
+                break;
+            }
+            if ($sql[$i] === "'") {
+                $i++;
+                $val = '';
+                while ($i < $len) {
+                    if ($sql[$i] === "'") {
+                        if ($i + 1 < $len && $sql[$i + 1] === "'") {
+                            $val .= "'";
+                            $i += 2;
+                            continue;
+                        }
+                        $i++;
+                        break;
+                    }
+                    $val .= $sql[$i];
+                    $i++;
+                }
+                $values[] = $val;
+            } else {
+                $start = $i;
+                while ($i < $len && $sql[$i] !== ',' && $sql[$i] !== ')') {
+                    $i++;
+                }
+                $token = trim(substr($sql, $start, $i - $start));
+                $values[] = strtoupper($token) === 'NULL' ? null : $token;
+            }
+            while ($i < $len && $sql[$i] === ' ') {
+                $i++;
+            }
+            if ($i < $len && $sql[$i] === ',') {
+                $i++;
+            }
+        }
+        return $values;
     }
 
     private static function ownedEvent(string $sql, ?array $row): bool

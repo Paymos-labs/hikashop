@@ -320,7 +320,7 @@ final class RefundFlowTest extends TestCase
     public function testComposerManifestRequiresPaymosPhpSdkOneTen(): void
     {
         $composer = json_decode((string) file_get_contents(dirname(__DIR__) . '/composer.json'), true, 64, JSON_THROW_ON_ERROR);
-        self::assertSame('^1.10.0', $composer['require']['paymos/php-sdk'] ?? null);
+        self::assertSame('^1.11.0', $composer['require']['paymos/php-sdk'] ?? null);
         self::assertSame('refund_preflight_retry', NativeRefundProjectorInterface::PREFLIGHT_RETRY);
     }
 

@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-20
+
+- fix(checkout): enforce PHP SDK compatibility across CMS packages
+- refactor(checkout): remove product images from invoice products
+- feat(plugins): add products[] and products_json migration to HikaShop 1.1.0 (10.1)
+- chore: bundle Paymos PHP SDK v1.11.1
+- chore: rebuild canonical CMS package
+
 ## [1.0.14] - 2026-11-16
 
 - chore: rebuild canonical CMS package

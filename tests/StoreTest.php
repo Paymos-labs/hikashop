@@ -137,6 +137,9 @@ final class StoreTest extends TestCase
             if (str_contains($sql, 'paymos_attempt')) {
                 return $pending;
             }
+            if (str_contains($sql, 'hikashop_order_product')) {
+                return [];
+            }
             if (str_contains($sql, 'hikashop_order')) {
                 return $this->nativeOrder();
             }
@@ -172,6 +175,9 @@ final class StoreTest extends TestCase
             'external_order_id' => 'hikashop_A', 'invoice_id' => null, 'payment_url' => null, 'status' => 'creating',
         ];
         [$db, $fixture] = $this->database(static function (string $sql) use (&$attempt, &$order) {
+            if (str_contains($sql, 'hikashop_order_product')) {
+                return [];
+            }
             if (str_contains($sql, 'hikashop_order')) {
                 return $order;
             }
@@ -248,6 +254,383 @@ final class StoreTest extends TestCase
         self::assertSame(count($dropped[1]), substr_count($uninstall, 'DROP TABLE'));
         self::assertMatchesRegularExpression('/UNIQUE KEY .request_token. \(.installation_id., .request_token.\)/', $install);
         self::assertMatchesRegularExpression('/UNIQUE KEY .withdrawal. \(.withdrawal_id.\)/', $install);
+        self::assertMatchesRegularExpression('/`products_json`\s+LONGTEXT\s+NULL/', $install);
+    }
+
+    public function testDescriptionSelectionSupportsPublishedMinimumSdkApi(): void
+    {
+        // Load the real Store in a clean PHP process so the local four-argument
+        // SDK cannot replace the published minimum's five-required-argument ABI.
+        $script = <<<'PHP'
+declare(strict_types=1);
+namespace Paymos\Plugin {
+    final class InvoicePresentation
+    {
+        public static array $descriptions = [];
+
+        public static function normalizeProduct(
+            ?string $title,
+            ?string $description,
+            ?string $imageUrl,
+            $quantity,
+            ?string $unitAmount
+        ): ?array {
+            self::$descriptions[] = $description;
+            $item = ['title' => $title, 'quantity' => $quantity, 'unit_amount' => $unitAmount];
+            $text = html_entity_decode(strip_tags($description ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if (preg_match('/\S/u', $text) === 1) {
+                $item['description'] = 'normalized description, not the original HTML';
+            }
+            return $item;
+        }
+
+        public static function normalizeProducts(iterable $candidates): ?array
+        {
+            $products = [];
+            foreach ($candidates as $candidate) {
+                $products[] = self::normalizeProduct(
+                    $candidate['title'],
+                    $candidate['description'],
+                    null,
+                    $candidate['quantity'],
+                    $candidate['unit_amount']
+                );
+            }
+            return $products ?: null;
+        }
+    }
+}
+namespace {
+    define('_JEXEC', 1);
+    require $argv[1];
+    $store = (new \ReflectionClass(\PaymosHikaShop\Store::class))->newInstanceWithoutConstructor();
+    $method = new \ReflectionMethod(\PaymosHikaShop\Store::class, 'resolveProductDescription');
+    $cases = [
+        [105 => ['product_description' => '<p>&nbsp;</p>'], 100 => ['product_description' => '<p>Archival</p><p>Print</p>']],
+        [105 => ['product_description' => '<p>Variant &amp; finish</p>'], 100 => ['product_description' => '<p>Unused parent</p>']],
+        [105 => ['product_description' => '<p>&nbsp;</p>'], 100 => ['product_description' => " \t\n"]],
+    ];
+    $observations = [];
+    foreach ($cases as $products) {
+        \Paymos\Plugin\InvoicePresentation::$descriptions = [];
+        $observations[] = [
+            'description' => $method->invoke($store, 105, 100, $products),
+            'probed' => \Paymos\Plugin\InvoicePresentation::$descriptions,
+        ];
+    }
+    echo json_encode($observations, JSON_THROW_ON_ERROR);
+}
+PHP;
+        $process = proc_open(
+            [PHP_BINARY, '-d', 'display_errors=stderr', '-r', $script, dirname(__DIR__) . '/src/Store.php'],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        self::assertIsResource($process);
+        fclose($pipes[0]);
+        $output = stream_get_contents($pipes[1]);
+        $errors = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        self::assertSame(0, proc_close($process), (string) $errors);
+        self::assertSame([
+            [
+                'description' => '<p>Archival</p><p>Print</p>',
+                'probed' => ['<p>&nbsp;</p>', '<p>Archival</p><p>Print</p>'],
+            ],
+            [
+                'description' => '<p>Variant &amp; finish</p>',
+                'probed' => ['<p>Variant &amp; finish</p>'],
+            ],
+            [
+                'description' => null,
+                'probed' => ['<p>&nbsp;</p>', " \t\n"],
+            ],
+        ], json_decode((string) $output, true, 512, JSON_THROW_ON_ERROR));
+    }
+
+    public function testBeginAttemptPersistsProductsJsonAndRejectsSnapshotMismatch(): void
+    {
+        $order = $this->nativeOrder();
+        $orderProducts = [
+            [
+                'order_product_id' => '1',
+                'product_id' => '105',
+                'order_product_name' => '<b>Canvas</b> &amp; Blue',
+                'order_product_quantity' => '2',
+                'order_product_price' => '24.50000',
+            ],
+            [
+                'order_product_id' => '2',
+                'product_id' => '200',
+                'order_product_name' => 'Notebook',
+                'order_product_quantity' => '1',
+                'order_product_price' => '12.00000',
+            ],
+        ];
+        $products = [
+            ['product_id' => '105', 'product_parent_id' => '100', 'product_description' => '<p>&nbsp;</p>'],
+            ['product_id' => '100', 'product_parent_id' => '0', 'product_description' => '<p>Archival</p><p>Print</p>'],
+            ['product_id' => '200', 'product_parent_id' => '0', 'product_description' => '   '],
+        ];
+        $attempts = [];
+        [$db, $fixture] = $this->database(function (string $sql) use (&$order, &$orderProducts, &$products, &$attempts) {
+            if (str_contains($sql, 'hikashop_paymos_attempt')) {
+                if (str_starts_with($sql, 'INSERT INTO')) {
+                    $gen = count($attempts) + 1;
+                    $jsonPos = strrpos($sql, 'VALUES (');
+                    $valuesPart = substr($sql, $jsonPos + 8, -1);
+                    $lastComma = strrpos($valuesPart, ', ');
+                    $rawProducts = substr($valuesPart, $lastComma + 2);
+                    $productsJson = $rawProducts === 'NULL'
+                        ? null
+                        : str_replace("''", "'", substr($rawProducts, 1, -1));
+                    $attempts[$gen] = [
+                        'order_id' => '42',
+                        'generation' => (string) $gen,
+                        'method_id' => '7',
+                        'environment' => 'sandbox',
+                        'project_id' => 'prj_A',
+                        'external_order_id' => 'hikashop_' . $gen,
+                        'invoice_id' => null,
+                        'amount' => '12.34000',
+                        'currency' => 'EUR',
+                        'payment_url' => null,
+                        'status' => 'creating',
+                        'review_reason' => null,
+                        'products_json' => $productsJson,
+                    ];
+                    return true;
+                }
+                if (str_starts_with($sql, 'UPDATE')) {
+                    preg_match('/AND generation = (\d+)/', $sql, $m);
+                    $attempts[(int) $m[1]]['status'] = 'rejected';
+                    return true;
+                }
+                if (preg_match('/AND generation = (\d+)/', $sql, $m)) {
+                    return $attempts[(int) $m[1]] ?? null;
+                }
+                return $attempts === [] ? null : end($attempts);
+            }
+            if (str_contains($sql, 'hikashop_order_product')) {
+                return $orderProducts;
+            }
+            if (str_contains($sql, 'hikashop_product')) {
+                preg_match('/WHERE product_id IN \(([^)]+)\)/', $sql, $m);
+                $ids = array_map('trim', explode(',', $m[1]));
+                return array_values(array_filter($products, static fn (array $p): bool => in_array($p['product_id'], $ids, true)));
+            }
+            if (str_contains($sql, 'hikashop_order')) {
+                return $order;
+            }
+            if (str_contains($sql, 'hikashop_payment')) {
+                return ['payment_id' => 7, 'payment_type' => 'paymos', 'payment_published' => 1];
+            }
+            return 'EUR';
+        });
+        $store = new Store($db);
+
+        $first = $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR'));
+        $expectedProducts = [
+            [
+                'title' => 'Canvas & Blue',
+                'quantity' => 2,
+                'unit_amount' => '24.5',
+                'description' => "Archival\nPrint",
+            ],
+            [
+                'title' => 'Notebook',
+                'quantity' => 1,
+                'unit_amount' => '12',
+            ],
+        ];
+        self::assertSame($expectedProducts, Store::decodeProductsJson($first['products_json']));
+        self::assertStringNotContainsString('hikashop_file', implode("\n", $fixture->queries));
+        self::assertSame(1, substr_count(implode("\n", $fixture->queries), 'INSERT INTO'));
+
+        $reused = $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR'));
+        self::assertSame($first['products_json'], $reused['products_json']);
+        self::assertSame(1, substr_count(implode("\n", $fixture->queries), 'INSERT INTO'));
+
+        $orderProducts[1]['order_product_name'] = 'Notebook v2';
+        try {
+            $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR'));
+            self::fail('A changed product snapshot must not match an open creating attempt.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('paymos_attempt_open', $error->getMessage());
+        }
+
+        try {
+            $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR', null));
+            self::fail('Explicit amount-only snapshot must mismatch persisted products_json.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('paymos_attempt_open', $error->getMessage());
+        }
+
+        foreach (['', '[]', '{invalid', '[{}]'] as $badJson) {
+            try {
+                $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR', $badJson));
+                self::fail('Invalid products_json must be rejected.');
+            } catch (\InvalidArgumentException $error) {
+                self::assertSame('paymos_attempt_invalid', $error->getMessage());
+            }
+        }
+
+        $store->withOrderLock(42, fn () => $store->recordAttemptState(42, 1, 'rejected'));
+        $second = $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR'));
+        self::assertSame(2, $second['generation']);
+        self::assertSame('Notebook v2', Store::decodeProductsJson($second['products_json'])[1]['title']);
+    }
+
+    public function testLegacyProductsProjectionKeepsRawSnapshotAndItsExactValues(): void
+    {
+        $products = [
+            [
+                'title' => '  Canvas "Pro" \\ €  ',
+                'description' => "Original\nDescription 'quoted' \\ €",
+                'image_url' => 'https://legacy.example/original.webp',
+                'quantity' => 2,
+                'unit_amount' => '12345678901234567890.123456789012345678',
+            ],
+            ['title' => 'Free Support', 'quantity' => 1, 'unit_amount' => '0.00'],
+        ];
+        $raw = json_encode($products, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        $legacy = [
+            'order_id' => '42', 'generation' => '1', 'method_id' => '7',
+            'environment' => 'sandbox', 'project_id' => 'prj_A', 'amount' => '12.34000', 'currency' => 'EUR',
+            'external_order_id' => 'hikashop_legacy', 'invoice_id' => null, 'payment_url' => null,
+            'status' => 'creating', 'products_json' => $raw,
+        ];
+        [$db, $fixture] = $this->database(function (string $sql) use ($legacy) {
+            if (str_contains($sql, 'paymos_attempt')) {
+                return $legacy;
+            }
+            if (str_contains($sql, 'hikashop_order_product') || str_contains($sql, 'hikashop_product')
+                || str_contains($sql, 'hikashop_file')) {
+                throw new \LogicException('Legacy recovery must not read native products or images.');
+            }
+            if (str_contains($sql, 'hikashop_order')) {
+                return $this->nativeOrder();
+            }
+            if (str_contains($sql, 'hikashop_payment')) {
+                return ['payment_id' => 7, 'payment_type' => 'paymos', 'payment_published' => 1];
+            }
+            return 'EUR';
+        });
+        $store = new Store($db);
+        $reused = $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR', $raw));
+        self::assertSame($raw, $reused['products_json']);
+        self::assertSame('hikashop_legacy', $reused['external_order_id']);
+        self::assertSame(1, $reused['generation']);
+        $expected = $products;
+        unset($expected[0]['image_url']);
+        self::assertSame($expected, Store::decodeProductsJson($reused['products_json']));
+        self::assertSame($raw, $store->currentAttempt(42)['products_json']);
+
+        // Equality still uses the original bytes, including the historical field.
+        $products[0]['image_url'] = 'https://legacy.example/changed.webp';
+        $changedRaw = json_encode($products, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+        try {
+            $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR', $changedRaw));
+            self::fail('Changing only the frozen historical key must still fail the raw snapshot comparison.');
+        } catch (\RuntimeException $error) {
+            self::assertSame('paymos_attempt_open', $error->getMessage());
+        }
+        self::assertStringNotContainsString('INSERT INTO', implode("\n", $fixture->queries));
+        self::assertStringNotContainsString('UPDATE ', implode("\n", $fixture->queries));
+
+        // Removing the obsolete key does not relax the existing required-field checks.
+        foreach (['title' => '', 'quantity' => '2', 'unit_amount' => 2] as $field => $invalid) {
+            $invalidProducts = $products;
+            $invalidProducts[0][$field] = $invalid;
+            try {
+                Store::decodeProductsJson(json_encode($invalidProducts, JSON_THROW_ON_ERROR));
+                self::fail('Invalid frozen ' . $field . ' must remain rejected.');
+            } catch (\RuntimeException $error) {
+                self::assertSame('paymos_attempt_products_invalid', $error->getMessage());
+            }
+        }
+    }
+
+    public function testLegacyNullProductsRowCompatibility(): void
+    {
+        $legacy = [
+            'order_id' => '42',
+            'generation' => '1',
+            'method_id' => '7',
+            'environment' => 'sandbox',
+            'project_id' => 'prj_A',
+            'amount' => '12.34000',
+            'currency' => 'EUR',
+            'external_order_id' => 'hikashop_legacy',
+            'invoice_id' => null,
+            'payment_url' => null,
+            'status' => 'creating',
+        ];
+        $orderProducts = [];
+        [$db] = $this->database(function (string $sql) use ($legacy, &$orderProducts) {
+            if (str_contains($sql, 'paymos_attempt')) {
+                return $legacy;
+            }
+            if (str_contains($sql, 'hikashop_order_product')) {
+                return $orderProducts;
+            }
+            if (str_contains($sql, 'hikashop_order')) {
+                return $this->nativeOrder();
+            }
+            if (str_contains($sql, 'hikashop_payment')) {
+                return ['payment_id' => 7, 'payment_type' => 'paymos', 'payment_published' => 1];
+            }
+            return 'EUR';
+        });
+        $store = new Store($db);
+
+        $loaded = $store->currentAttempt(42);
+        self::assertArrayHasKey('products_json', $loaded);
+        self::assertNull($loaded['products_json']);
+
+        $reused = $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR'));
+        self::assertSame('hikashop_legacy', $reused['external_order_id']);
+        self::assertNull($reused['products_json']);
+
+        $orderProducts = [[
+            'order_product_id' => '1',
+            'product_id' => '0',
+            'order_product_name' => 'Manual Item',
+            'order_product_quantity' => '1',
+            'order_product_price' => '12.34000',
+        ]];
+        $reusedOnRetry = $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR', null));
+        self::assertNull($reusedOnRetry['products_json']);
+
+        $this->expectExceptionMessage('paymos_attempt_open');
+        $store->withOrderLock(42, fn () => $store->beginAttempt(42, 7, 'sandbox', 'prj_A', '12.34', 'EUR'));
+    }
+
+    public function testPostflightMigrationIsIdempotentViaInformationSchema(): void
+    {
+        require_once __DIR__ . '/../script.php';
+        $columnExists = 0;
+        [$db, $fixture] = $this->database(static function (string $sql) use (&$columnExists) {
+            if (str_contains($sql, 'information_schema.COLUMNS')) {
+                return $columnExists;
+            }
+            if (str_starts_with($sql, 'ALTER TABLE')) {
+                $columnExists = 1;
+                return true;
+            }
+            return true;
+        });
+
+        self::assertTrue(\PlgHikashoppaymentPaymosInstallerScript::ensureAttemptProductsColumn($db));
+        self::assertSame(1, $columnExists);
+        self::assertTrue(\PlgHikashoppaymentPaymosInstallerScript::ensureAttemptProductsColumn($db));
+
+        $queries = $fixture->queries;
+        self::assertCount(3, $queries);
+        self::assertStringContainsString("information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fixture_hikashop_paymos_attempt' AND COLUMN_NAME = 'products_json'", $queries[0]);
+        self::assertSame('ALTER TABLE `#__hikashop_paymos_attempt` ADD COLUMN `products_json` LONGTEXT NULL', $queries[1]);
+        self::assertStringContainsString('information_schema.COLUMNS', $queries[2]);
     }
 
     private function nativeOrder(): array
@@ -269,7 +652,7 @@ final class StoreTest extends TestCase
         ];
         $db = $this->getMockBuilder(MysqliDriver::class)->disableOriginalConstructor()->onlyMethods([
             'setQuery', 'getMonitor', 'setMonitor', 'getPrefix', 'getConnection', 'quote', 'quoteName',
-            'loadResult', 'loadAssoc', 'execute', 'disconnect',
+            'loadResult', 'loadAssoc', 'loadAssocList', 'execute', 'disconnect',
         ])->getMock();
         $db->method('setQuery')->willReturnCallback(static function ($sql) use ($fixture, $db) {
             $fixture->sql = $sql;
@@ -306,6 +689,7 @@ final class StoreTest extends TestCase
         };
         $db->method('loadResult')->willReturnCallback($query);
         $db->method('loadAssoc')->willReturnCallback($query);
+        $db->method('loadAssocList')->willReturnCallback($query);
         $db->method('execute')->willReturnCallback($query);
 
         return [$db, $fixture];

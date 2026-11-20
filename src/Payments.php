@@ -96,21 +96,35 @@ final class Payments
 
             // beginAttempt commits the original request before HTTP. An unbound row
             // with changed inputs refuses a new generation until the old outcome is known.
-            $attempt = $this->store->beginAttempt(
-                $orderId, $methodId, $environment, $keys['project_id'], $order['amount'], $order['currency']
-            );
+            if ($current !== null && $current['invoice_id'] === null
+                && !in_array($current['status'], ['rejected', 'cancelled', 'expired', 'underpaid'], true)) {
+                $attempt = $this->store->beginAttempt(
+                    $orderId, $methodId, $environment, $keys['project_id'], $order['amount'], $order['currency'],
+                    $current['products_json'] ?? null
+                );
+            } else {
+                $attempt = $this->store->beginAttempt(
+                    $orderId, $methodId, $environment, $keys['project_id'], $order['amount'], $order['currency']
+                );
+            }
             if ($attempt['status'] === 'rejected') {
                 throw new \RuntimeException('paymos_invalid_invoice_amount');
             }
 
             $this->assertCheckoutSnapshot($attempt);
+            $payload = [
+                'project_id' => $attempt['project_id'],
+                'external_order_id' => $attempt['external_order_id'],
+                'amount' => $attempt['amount'],
+                'currency' => $attempt['currency'],
+            ];
+            // Project only the outbound copy; raw products_json remains the retry snapshot.
+            $products = Store::decodeProductsJson($attempt['products_json'] ?? null);
+            if ($products !== null) {
+                $payload['products'] = $products;
+            }
             try {
-                $invoice = ($this->clientFactory)($keys, $environment)->invoices()->create([
-                    'project_id' => $attempt['project_id'],
-                    'external_order_id' => $attempt['external_order_id'],
-                    'amount' => $attempt['amount'],
-                    'currency' => $attempt['currency'],
-                ]);
+                $invoice = ($this->clientFactory)($keys, $environment)->invoices()->create($payload);
             } catch (ValidationException $error) {
                 if ($error->statusCode() === 400 && $error->errorCode() === 'amount_too_many_decimals'
                     && $error->field() === 'amount') {

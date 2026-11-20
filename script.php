@@ -67,6 +67,42 @@ final class PlgHikashoppaymentPaymosInstallerScript
         return true;
     }
 
+    public function postflight($type, $parent): bool
+    {
+        if (!in_array($type, ['install', 'update', 'discover_install'], true)) {
+            return true;
+        }
+
+        try {
+            $db = Factory::getContainer()->get(DatabaseInterface::class);
+            if (!self::ensureAttemptProductsColumn($db)) {
+                return $this->reject('Paymos for HikaShop could not update the payment attempt table.');
+            }
+        } catch (Throwable) {
+            return $this->reject('Paymos for HikaShop could not update the payment attempt table.');
+        }
+
+        return true;
+    }
+
+    public static function ensureAttemptProductsColumn(DatabaseInterface $db): bool
+    {
+        $tableName = $db->getPrefix() . 'hikashop_paymos_attempt';
+        $exists = (int) $db->setQuery(
+            'SELECT COUNT(*) FROM information_schema.COLUMNS'
+            . ' WHERE TABLE_SCHEMA = DATABASE()'
+            . ' AND TABLE_NAME = ' . $db->quote($tableName)
+            . " AND COLUMN_NAME = 'products_json'"
+        )->loadResult();
+        if ($exists > 0) {
+            return true;
+        }
+
+        $table = $db->quoteName('#__hikashop_paymos_attempt');
+        $column = $db->quoteName('products_json');
+        return $db->setQuery("ALTER TABLE $table ADD COLUMN $column LONGTEXT NULL")->execute() !== false;
+    }
+
     private function reject(string $message): bool
     {
         Factory::getApplication()->enqueueMessage($message, 'error');

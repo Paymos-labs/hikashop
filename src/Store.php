@@ -10,6 +10,7 @@ namespace PaymosHikaShop;
 use Joomla\Database\DatabaseInterface;
 use Joomla\Database\QueryMonitorInterface;
 use Paymos\Plugin\AmountGuard;
+use Paymos\Plugin\InvoicePresentation;
 
 defined('_JEXEC') or die;
 
@@ -268,8 +269,10 @@ final class Store
         string $environment,
         string $projectId,
         string $amount,
-        string $currency
+        string $currency,
+        ?string $productsJson = null
     ): array {
+        $resolveProducts = func_num_args() < 7;
         $this->assertOrderLock($orderId);
         if ($this->inTransaction) {
             throw new \RuntimeException('paymos_attempt_requires_commit');
@@ -277,22 +280,36 @@ final class Store
         $amount = AmountGuard::normalizeDecimal($amount);
         if (!in_array($environment, ['sandbox', 'live'], true) || !preg_match('/\Aprj_[a-zA-Z0-9_-]{1,124}\z/', $projectId)
             || $amount === null || !preg_match('/\A(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,5})?\z/', $amount)
-            || $amount === '0' || !preg_match('/\A[A-Z0-9]{3,12}\z/', $currency)) {
+            || $amount === '0' || !preg_match('/\A[A-Z0-9]{3,12}\z/', $currency)
+            || (!$resolveProducts && !$this->validProductsJson($productsJson))) {
             throw new \InvalidArgumentException('paymos_attempt_invalid');
         }
 
-        return $this->transaction($orderId, function () use ($orderId, $methodId, $environment, $projectId, $amount, $currency) {
+        return $this->transaction($orderId, function () use (
+            $orderId,
+            $methodId,
+            $environment,
+            $projectId,
+            $amount,
+            $currency,
+            $productsJson,
+            $resolveProducts
+        ) {
             $order = $this->nativeOrder($orderId, true);
             if ($order === null || $order['method_id'] !== $methodId || $order['amount'] !== $amount
                 || $order['currency'] !== $currency || ($this->nativeMethod($methodId)['payment_published'] ?? 0) !== 1) {
                 throw new \RuntimeException('paymos_order_changed');
             }
 
+            if ($resolveProducts) {
+                $productsJson = $this->orderProductsJson($orderId);
+            }
+
             $current = $this->currentAttempt($orderId);
             if ($current !== null) {
                 $sameSnapshot = $current['method_id'] === $methodId && $current['environment'] === $environment
                     && $current['project_id'] === $projectId && $current['amount'] === $amount
-                    && $current['currency'] === $currency;
+                    && $current['currency'] === $currency && $current['products_json'] === $productsJson;
                 if ($current['status'] === 'rejected') {
                     if ($current['invoice_id'] !== null) {
                         throw new \RuntimeException('paymos_attempt_open');
@@ -311,10 +328,20 @@ final class Store
             $generation = ($current['generation'] ?? 0) + 1;
             $externalId = 'hikashop_' . hash('sha256', $this->installationId() . ':' . $orderId . ':' . $generation);
             $table = $this->db->quoteName(self::ATTEMPTS);
-            $values = implode(', ', [$orderId, $generation, $methodId, $this->db->quote($environment), $this->db->quote($projectId),
-                $this->db->quote($externalId), $this->db->quote($amount), $this->db->quote($currency)]);
+            $quotedProducts = $productsJson === null ? 'NULL' : $this->db->quote($productsJson);
+            $values = implode(', ', [
+                $orderId,
+                $generation,
+                $methodId,
+                $this->db->quote($environment),
+                $this->db->quote($projectId),
+                $this->db->quote($externalId),
+                $this->db->quote($amount),
+                $this->db->quote($currency),
+                $quotedProducts,
+            ]);
             $this->write("INSERT INTO $table (order_id, generation, method_id, environment, project_id,"
-                . " external_order_id, amount, currency) VALUES ($values)");
+                . " external_order_id, amount, currency, products_json) VALUES ($values)");
 
             return $this->requireAttempt($orderId, $generation);
         });
@@ -596,8 +623,183 @@ final class Store
         if ($row['amount'] === null || $row['amount'] === '0' || $row['amount'][0] === '-') {
             throw new \RuntimeException('paymos_attempt_amount_invalid');
         }
+        $row['products_json'] = isset($row['products_json']) && is_string($row['products_json']) && $row['products_json'] !== ''
+            ? $row['products_json']
+            : null;
 
         return $row;
+    }
+
+    /**
+     * Decode an outbound copy without changing the frozen JSON.
+     * @return array<int, array<string, mixed>>|null
+     */
+    public static function decodeProductsJson(?string $productsJson): ?array
+    {
+        if ($productsJson === null) {
+            return null;
+        }
+        if ($productsJson === '') {
+            throw new \RuntimeException('paymos_attempt_products_invalid');
+        }
+
+        try {
+            $decoded = json_decode($productsJson, true, 64, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $error) {
+            throw new \RuntimeException('paymos_attempt_products_invalid', 0, $error);
+        }
+        if (!is_array($decoded) || $decoded === [] || count($decoded) > InvoicePresentation::MAX_ITEMS
+            || !array_is_list($decoded)) {
+            throw new \RuntimeException('paymos_attempt_products_invalid');
+        }
+        foreach ($decoded as $index => $item) {
+            if (is_array($item)) {
+                unset($item['image_url']);
+                $decoded[$index] = $item;
+            }
+            if (!is_array($item) || !is_string($item['title'] ?? null) || $item['title'] === ''
+                || !is_int($item['quantity'] ?? null) || $item['quantity'] < 1
+                || !is_string($item['unit_amount'] ?? null) || $item['unit_amount'] === '') {
+                throw new \RuntimeException('paymos_attempt_products_invalid');
+            }
+        }
+
+        return $decoded;
+    }
+
+    private function orderProductsJson(int $orderId): ?string
+    {
+        $orderProductsTable = $this->db->quoteName('#__hikashop_order_product');
+        $rows = $this->db->setQuery(
+            'SELECT order_product_id, product_id, order_product_name, order_product_quantity, order_product_price'
+            . " FROM $orderProductsTable WHERE order_id = $orderId ORDER BY order_product_id ASC"
+        )->loadAssocList();
+        if (!is_array($rows) || $rows === [] || count($rows) > InvoicePresentation::MAX_ITEMS) {
+            return null;
+        }
+
+        $productIds = [];
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                return null;
+            }
+            $productId = $this->positiveId($row['product_id'] ?? null);
+            if ($productId !== null) {
+                $productIds[$productId] = $productId;
+            }
+        }
+
+        $productsById = $this->fetchProductsByIds(array_values($productIds));
+        $parentIds = [];
+        foreach ($productsById as $productRow) {
+            $parentId = $this->positiveId($productRow['product_parent_id'] ?? null);
+            if ($parentId !== null && !isset($productsById[$parentId])) {
+                $parentIds[$parentId] = $parentId;
+            }
+        }
+        if ($parentIds !== []) {
+            $productsById += $this->fetchProductsByIds(array_values($parentIds));
+        }
+
+        $candidates = [];
+        foreach ($rows as $row) {
+            $productId = $this->positiveId($row['product_id'] ?? null);
+            $parentId = $productId !== null ? $this->positiveId($productsById[$productId]['product_parent_id'] ?? null) : null;
+            $candidates[] = [
+                'title' => $row['order_product_name'] ?? null,
+                'description' => $this->resolveProductDescription($productId, $parentId, $productsById),
+                'quantity' => $row['order_product_quantity'] ?? null,
+                'unit_amount' => $this->normalizeLineUnitAmount($row['order_product_price'] ?? null),
+            ];
+        }
+
+        $normalized = InvoicePresentation::normalizeProducts($candidates);
+        if ($normalized === null) {
+            return null;
+        }
+
+        return json_encode($normalized, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR);
+    }
+
+    /** @param list<int> $ids */
+    private function fetchProductsByIds(array $ids): array
+    {
+        if ($ids === []) {
+            return [];
+        }
+
+        $productsTable = $this->db->quoteName('#__hikashop_product');
+        $idList = implode(', ', $ids);
+        $rows = $this->db->setQuery(
+            "SELECT product_id, product_parent_id, product_description FROM $productsTable"
+            . " WHERE product_id IN ($idList)"
+        )->loadAssocList();
+        if (!is_array($rows)) {
+            return [];
+        }
+
+        $byId = [];
+        foreach ($rows as $productRow) {
+            if (!is_array($productRow)) {
+                continue;
+            }
+            $id = $this->positiveId($productRow['product_id'] ?? null);
+            if ($id !== null) {
+                $byId[$id] = $productRow;
+            }
+        }
+
+        return $byId;
+    }
+
+    private function resolveProductDescription(?int $productId, ?int $parentId, array $productsById): ?string
+    {
+        if ($productId === null) {
+            return null;
+        }
+        foreach ([$productId, $parentId] as $candidateId) {
+            if ($candidateId === null) {
+                continue;
+            }
+            $raw = $productsById[$candidateId]['product_description'] ?? null;
+            if (!is_string($raw) || $raw === '') {
+                continue;
+            }
+            $probe = InvoicePresentation::normalizeProducts([[
+                'title' => 'item',
+                'description' => $raw,
+                'quantity' => 1,
+                'unit_amount' => '0',
+            ]]);
+            if (is_array($probe) && isset($probe[0]['description'])) {
+                return $raw;
+            }
+        }
+
+        return null;
+    }
+
+    private function normalizeLineUnitAmount(mixed $value): ?string
+    {
+        if (!is_string($value) || strpos($value, "\0") !== false) {
+            return null;
+        }
+        $trimmed = trim($value);
+        if (preg_match('/\A(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\z/', $trimmed) !== 1) {
+            return null;
+        }
+
+        return AmountGuard::normalizeDecimal($trimmed);
+    }
+
+    private function validProductsJson(?string $productsJson): bool
+    {
+        try {
+            self::decodeProductsJson($productsJson);
+            return true;
+        } catch (\RuntimeException) {
+            return false;
+        }
     }
 
     private function requireAttempt(int $orderId, int $generation): array
