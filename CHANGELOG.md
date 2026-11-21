@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-21
+
+- chore: rebuild canonical CMS package
+
 ## [1.1.0] - 2026-11-20
 
 - fix(checkout): enforce PHP SDK compatibility across CMS packages
