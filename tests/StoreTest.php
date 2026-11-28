@@ -349,6 +349,205 @@ PHP;
         ], json_decode((string) $output, true, 512, JSON_THROW_ON_ERROR));
     }
 
+    public function testInvoicePresentationCompatibilityMatrixWithoutSharedAutoload(): void
+    {
+        $storePath = dirname(__DIR__) . '/src/Store.php';
+        $sdkCandidates = [
+            dirname(__DIR__, 2) . '/php-sdk/src/Plugin/InvoicePresentation.php',
+            dirname(__DIR__) . '/vendor/paymos/php-sdk/src/Plugin/InvoicePresentation.php',
+        ];
+        $currentSdkPath = null;
+        foreach ($sdkCandidates as $candidate) {
+            if (is_file($candidate)) {
+                $currentSdkPath = $candidate;
+                break;
+            }
+        }
+        self::assertNotNull($currentSdkPath, 'Expected Paymos PHP SDK InvoicePresentation.php to exist.');
+
+        $runIsolated = static function (string $script, array $args): array {
+            $process = proc_open(
+                array_merge([PHP_BINARY, '-d', 'display_errors=stderr', '-r', $script], $args),
+                [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+                $pipes
+            );
+            self::assertIsResource($process);
+            fclose($pipes[0]);
+            $output = stream_get_contents($pipes[1]);
+            $errors = stream_get_contents($pipes[2]);
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            self::assertSame(0, proc_close($process), (string) $errors);
+            return json_decode((string) $output, true, 512, JSON_THROW_ON_ERROR);
+        };
+
+        // Matrix cell 1 & 2: Current Store.php against current InvoicePresentation (direct file require, zero autoload).
+        $newStoreNewSdkScript = <<<'PHP'
+declare(strict_types=1);
+define('_JEXEC', 1);
+require $argv[1];
+require $argv[2];
+$store = (new \ReflectionClass(\PaymosHikaShop\Store::class))->newInstanceWithoutConstructor();
+$resolveDesc = new \ReflectionMethod(\PaymosHikaShop\Store::class, 'resolveProductDescription');
+$descFallback = $resolveDesc->invoke($store, 105, 100, [
+    105 => ['product_description' => '<p>&nbsp;</p>'],
+    100 => ['product_description' => '<p>Archival</p><p>Print</p>'],
+]);
+$normalized = \Paymos\Plugin\InvoicePresentation::normalizeProducts([
+    [
+        'title' => '<b>Canvas</b> &amp; Blue',
+        'description' => $descFallback,
+        'quantity' => 2,
+        'unit_amount' => '15.00',
+    ],
+]);
+echo json_encode([
+    'description' => $descFallback,
+    'normalized' => $normalized,
+], JSON_THROW_ON_ERROR);
+PHP;
+        $newStoreNewSdk = $runIsolated($newStoreNewSdkScript, [$currentSdkPath, $storePath]);
+        self::assertSame('<p>Archival</p><p>Print</p>', $newStoreNewSdk['description']);
+        self::assertSame([[
+            'title' => 'Canvas & Blue',
+            'quantity' => 2,
+            'unit_amount' => '15.00',
+            'description' => "Archival\nPrint",
+        ]], $newStoreNewSdk['normalized']);
+
+        // Matrix cell 3 & 4: Legacy 5-arg (eb025e2ae5) & 4-arg (acaf693c33) callers against current InvoicePresentation
+        // in an isolated process without shared composer autoload fallback.
+        $legacyCallersCurrentSdkScript = <<<'PHP'
+declare(strict_types=1);
+require $argv[1];
+$fiveArgNull = \Paymos\Plugin\InvoicePresentation::normalizeProduct('Canvas', '<p>Line 1</p>', null, 2, '15.00');
+$fiveArgUrl = \Paymos\Plugin\InvoicePresentation::normalizeProduct('Canvas', '<p>Line 1</p>', 'https://cdn.example/old.png', 3, '15.00');
+$fiveArgNumericImg = \Paymos\Plugin\InvoicePresentation::normalizeProduct('Canvas', null, '99', 4, '15.00');
+$fiveArgNullAmount = \Paymos\Plugin\InvoicePresentation::normalizeProduct('Canvas', null, 'https://cdn.example/old.png', 2, null);
+$fourArg = \Paymos\Plugin\InvoicePresentation::normalizeProduct('Canvas', '<p>Line 1</p>', 2, '15.00');
+$fourArgBlankDesc = \Paymos\Plugin\InvoicePresentation::normalizeProduct('Canvas', '<p>&nbsp;</p>', 1, '1.00');
+$named = null;
+if (PHP_VERSION_ID >= 80000) {
+    $named = call_user_func_array(
+        [\Paymos\Plugin\InvoicePresentation::class, 'normalizeProduct'],
+        [
+            'title' => 'Canvas',
+            'description' => '<p>Named</p>',
+            'imageUrl' => 'https://cdn.example/old.png',
+            'quantity' => 5,
+            'unitAmount' => '15.00',
+        ]
+    );
+}
+echo json_encode([
+    'fiveArgNull' => $fiveArgNull,
+    'fiveArgUrl' => $fiveArgUrl,
+    'fiveArgNumericImg' => $fiveArgNumericImg,
+    'fiveArgNullAmount' => $fiveArgNullAmount,
+    'fourArg' => $fourArg,
+    'fourArgBlankDesc' => $fourArgBlankDesc,
+    'named' => $named,
+], JSON_THROW_ON_ERROR);
+PHP;
+        $legacyVsCurrent = $runIsolated($legacyCallersCurrentSdkScript, [$currentSdkPath]);
+        self::assertSame([
+            'title' => 'Canvas',
+            'quantity' => 2,
+            'unit_amount' => '15.00',
+            'description' => 'Line 1',
+        ], $legacyVsCurrent['fiveArgNull']);
+        self::assertSame([
+            'title' => 'Canvas',
+            'quantity' => 3,
+            'unit_amount' => '15.00',
+            'description' => 'Line 1',
+        ], $legacyVsCurrent['fiveArgUrl']);
+        self::assertSame([
+            'title' => 'Canvas',
+            'quantity' => 4,
+            'unit_amount' => '15.00',
+        ], $legacyVsCurrent['fiveArgNumericImg']);
+        self::assertNull($legacyVsCurrent['fiveArgNullAmount']);
+        self::assertSame([
+            'title' => 'Canvas',
+            'quantity' => 2,
+            'unit_amount' => '15.00',
+            'description' => 'Line 1',
+        ], $legacyVsCurrent['fourArg']);
+        self::assertSame([
+            'title' => 'Canvas',
+            'quantity' => 1,
+            'unit_amount' => '1.00',
+        ], $legacyVsCurrent['fourArgBlankDesc']);
+        if (PHP_VERSION_ID >= 80000) {
+            self::assertSame([
+                'title' => 'Canvas',
+                'quantity' => 5,
+                'unit_amount' => '15.00',
+                'description' => 'Named',
+            ], $legacyVsCurrent['named']);
+        }
+
+        // Matrix cell 5: Current Store.php against acaf693c33 strict 4-arg InvoicePresentation (zero autoload).
+        $newStoreFourArgStubScript = <<<'PHP'
+declare(strict_types=1);
+namespace Paymos\Plugin {
+    final class InvoicePresentation
+    {
+        public static array $descriptions = [];
+
+        public static function normalizeProduct(
+            ?string $title,
+            ?string $description,
+            $quantity,
+            ?string $unitAmount
+        ): ?array {
+            self::$descriptions[] = $description;
+            $item = ['title' => $title, 'quantity' => (int) $quantity, 'unit_amount' => $unitAmount];
+            $text = html_entity_decode(strip_tags($description ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+            if (preg_match('/\S/u', $text) === 1) {
+                $item['description'] = trim($text);
+            }
+            return $item;
+        }
+
+        public static function normalizeProducts(iterable $candidates): ?array
+        {
+            $products = [];
+            foreach ($candidates as $candidate) {
+                $products[] = self::normalizeProduct(
+                    $candidate['title'],
+                    $candidate['description'],
+                    $candidate['quantity'],
+                    $candidate['unit_amount']
+                );
+            }
+            return $products ?: null;
+        }
+    }
+}
+namespace {
+    define('_JEXEC', 1);
+    require $argv[1];
+    $store = (new \ReflectionClass(\PaymosHikaShop\Store::class))->newInstanceWithoutConstructor();
+    $resolveDesc = new \ReflectionMethod(\PaymosHikaShop\Store::class, 'resolveProductDescription');
+    $desc = $resolveDesc->invoke($store, 105, 100, [
+        105 => ['product_description' => '<p>&nbsp;</p>'],
+        100 => ['product_description' => '<p>Parent fallback</p>'],
+    ]);
+    echo json_encode([
+        'description' => $desc,
+        'probed' => \Paymos\Plugin\InvoicePresentation::$descriptions,
+    ], JSON_THROW_ON_ERROR);
+}
+PHP;
+        $newStoreFourArg = $runIsolated($newStoreFourArgStubScript, [$storePath]);
+        self::assertSame([
+            'description' => '<p>Parent fallback</p>',
+            'probed' => ['<p>&nbsp;</p>', '<p>Parent fallback</p>'],
+        ], $newStoreFourArg);
+    }
+
     public function testBeginAttemptPersistsProductsJsonAndRejectsSnapshotMismatch(): void
     {
         $order = $this->nativeOrder();
@@ -631,6 +830,146 @@ PHP;
         self::assertStringContainsString("information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fixture_hikashop_paymos_attempt' AND COLUMN_NAME = 'products_json'", $queries[0]);
         self::assertSame('ALTER TABLE `#__hikashop_paymos_attempt` ADD COLUMN `products_json` LONGTEXT NULL', $queries[1]);
         self::assertStringContainsString('information_schema.COLUMNS', $queries[2]);
+    }
+
+    public function testUpdateAddsProductsColumnInPreflightWhereJoomlaCanStillAbort(): void
+    {
+        // Joomla copies the new files before postflight and ignores its false result. Only preflight runs
+        // before the copy, so an update that cannot add products_json must stop there, on the old version.
+        $script = <<<'PHP'
+declare(strict_types=1);
+namespace Joomla\Database {
+    interface DatabaseInterface
+    {
+    }
+}
+namespace Joomla\CMS {
+    final class Factory
+    {
+        public static object $database;
+        public static array $messages = [];
+
+        public static function getContainer(): object
+        {
+            return new class {
+                public function get(string $id): object
+                {
+                    return Factory::$database;
+                }
+            };
+        }
+
+        public static function getApplication(): object
+        {
+            return new class {
+                public function enqueueMessage(string $message, string $type): void
+                {
+                    Factory::$messages[] = $message;
+                }
+            };
+        }
+    }
+}
+namespace Joomla\CMS\Component {
+    final class ComponentHelper
+    {
+        public static function isEnabled(string $option): bool
+        {
+            return $option === 'com_hikashop';
+        }
+    }
+}
+namespace Joomla\CMS\Installer {
+    final class Installer
+    {
+        public static function parseXMLInstallFile(string $path): array
+        {
+            return ['version' => '6.8.1'];
+        }
+    }
+}
+namespace {
+    define('_JEXEC', 1);
+    define('JVERSION', '5.4.10');
+    define('JPATH_ADMINISTRATOR', '/fixture/administrator');
+    require $argv[1];
+
+    final class FixtureDatabase implements \Joomla\Database\DatabaseInterface
+    {
+        public array $queries = [];
+        public bool $column = false;
+
+        public function __construct(private readonly bool $alterAllowed)
+        {
+        }
+
+        public function getPrefix(): string { return 'fixture_'; }
+        public function getServerType(): string { return 'mysql'; }
+        public function quote(string $text): string { return "'" . $text . "'"; }
+        public function quoteName(string $name): string { return '`' . $name . '`'; }
+
+        public function setQuery(string $sql): self
+        {
+            $this->queries[] = $sql;
+            return $this;
+        }
+
+        public function loadAssocList(string $key, string $column): array
+        {
+            $tables = ['order', 'history', 'product', 'order_product', 'discount', 'user'];
+            return array_fill_keys(array_map(static fn (string $table): string => 'fixture_hikashop_' . $table, $tables), 'InnoDB');
+        }
+
+        public function loadResult(): int
+        {
+            return $this->column ? 1 : 0;
+        }
+
+        public function execute(): bool
+        {
+            if (!$this->alterAllowed) {
+                throw new \RuntimeException('ALTER command denied to user');
+            }
+            $this->column = true;
+            return true;
+        }
+    }
+
+    $observations = [];
+    foreach ([['install', true], ['update', false], ['update', true]] as [$route, $alterAllowed]) {
+        \Joomla\CMS\Factory::$database = $db = new FixtureDatabase($alterAllowed);
+        \Joomla\CMS\Factory::$messages = [];
+        $observations[] = [
+            'accepted' => (new \PlgHikashoppaymentPaymosInstallerScript())->preflight($route, null),
+            'altered' => array_values(array_filter($db->queries, static fn (string $sql): bool => str_starts_with($sql, 'ALTER TABLE'))),
+            'column' => $db->column,
+            'messages' => \Joomla\CMS\Factory::$messages,
+        ];
+    }
+    echo json_encode($observations, JSON_THROW_ON_ERROR);
+}
+PHP;
+        $process = proc_open(
+            [PHP_BINARY, '-d', 'display_errors=stderr', '-r', $script, dirname(__DIR__) . '/script.php'],
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes
+        );
+        self::assertIsResource($process);
+        fclose($pipes[0]);
+        $output = stream_get_contents($pipes[1]);
+        $errors = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        self::assertSame(0, proc_close($process), (string) $errors);
+
+        $alter = 'ALTER TABLE `#__hikashop_paymos_attempt` ADD COLUMN `products_json` LONGTEXT NULL';
+        self::assertSame([
+            // A fresh install creates the table from install SQL after preflight.
+            ['accepted' => true, 'altered' => [], 'column' => false, 'messages' => []],
+            ['accepted' => false, 'altered' => [$alter], 'column' => false,
+                'messages' => ['Paymos for HikaShop could not update the payment attempt table.']],
+            ['accepted' => true, 'altered' => [$alter], 'column' => true, 'messages' => []],
+        ], json_decode((string) $output, true, 512, JSON_THROW_ON_ERROR));
     }
 
     private function nativeOrder(): array

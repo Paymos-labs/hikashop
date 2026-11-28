@@ -210,6 +210,31 @@ final class RefundFlowTest extends TestCase
         self::assertNull($fixture->payload()['review_reason']);
     }
 
+    #[TestWith([401])]
+    #[TestWith([403])]
+    #[TestWith([404])]
+    public function testAcceptedRefundWithATemporaryReadDenialIsReadAgainAndProjected(int $status): void
+    {
+        [$adapter, $fixture] = $this->scenario();
+        // Paymos accepted the POST; only the read right after it is denied, once.
+        $fixture->refundGetDenials = [$status];
+
+        $started = $this->submit($adapter, 'full');
+        self::assertSame('review', $started['status']);
+        self::assertSame('refund_read_unavailable', $fixture->payload()['review_reason']);
+        self::assertSame('confirmed', $fixture->orders[42]['order_status']);
+        self::assertSame(0, $fixture->nativeWrites);
+
+        $fixture->refundStatus = 'completed';
+        $checked = $adapter->adminAction('reconcile', 17, 42, ['operation_id' => $started['operation_id']]);
+        self::assertSame(['status' => 'completed', 'operation_id' => $started['operation_id']], $checked);
+        self::assertSame('wd_fixture', $fixture->payload()['withdrawal_id']);
+        self::assertNull($fixture->payload()['review_reason']);
+        self::assertSame('refunded', $fixture->orders[42]['order_status']);
+        self::assertSame(1, $fixture->nativeWrites);
+        self::assertCount(1, $fixture->posts);
+    }
+
     public function testUnknownPostCannotAdoptAWithdrawalIdFromTheEvent(): void
     {
         [$adapter, $fixture] = $this->scenario();
@@ -320,7 +345,7 @@ final class RefundFlowTest extends TestCase
     public function testComposerManifestRequiresPaymosPhpSdkOneTen(): void
     {
         $composer = json_decode((string) file_get_contents(dirname(__DIR__) . '/composer.json'), true, 64, JSON_THROW_ON_ERROR);
-        self::assertSame('^1.11.0', $composer['require']['paymos/php-sdk'] ?? null);
+        self::assertSame('^1.12.0', $composer['require']['paymos/php-sdk'] ?? null);
         self::assertSame('refund_preflight_retry', NativeRefundProjectorInterface::PREFLIGHT_RETRY);
     }
 
@@ -546,6 +571,8 @@ final class RefundFlowFixture implements TransportInterface
     public int $nativeWrites = 0;
     public bool $loseNextPost = false;
     public bool $loseNextGet = false;
+    /** @var list<int> HTTP statuses for the next refund detail reads. */
+    public array $refundGetDenials = [];
     public bool $loseNextInvoiceGet = false;
     public bool $failNativeWrite = false;
     public bool $refundWindowExpired = false;
@@ -656,6 +683,13 @@ final class RefundFlowFixture implements TransportInterface
             if ($this->loseNextGet) {
                 $this->loseNextGet = false;
                 throw new \RuntimeException('fixture lost GET response');
+            }
+            if ($this->refundGetDenials !== []) {
+                $denied = array_shift($this->refundGetDenials);
+                return new HttpResponse($denied, json_encode([
+                    'type' => 'https://paymos.io/docs/errors/codes#fixture_denied', 'title' => 'Denied',
+                    'status' => $denied, 'detail' => 'The fixture denied this read.', 'code' => 'fixture_denied',
+                ], JSON_THROW_ON_ERROR), ['Content-Type' => 'application/problem+json']);
             }
 
             $withdrawalId = $matches[1];

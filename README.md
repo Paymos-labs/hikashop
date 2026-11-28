@@ -1,6 +1,11 @@
 # Payment - Paymos for HikaShop
 
+**English** | [简体中文](README.zh-CN.md) | [Русский](README.ru.md) | [Español](README.es.md) | [Deutsch](README.de.md) | [Türkçe](README.tr.md)
+
 Accept stablecoin payments through Paymos hosted checkout in HikaShop. The extension is free and requires a Paymos account and project. Paymos service and blockchain network fees may apply. [Paymos pricing](https://paymos.io/pricing)
+
+[![Watch: 12 Official CMS Crypto Plugins — 1-Click Connect (Paymos)](https://i.ytimg.com/vi/VMLUGVumYkg/maxresdefault.jpg)](https://www.youtube.com/watch?v=VMLUGVumYkg)
+> **Video walkthrough (1:12, subtitles in 6 languages):** [Watch on YouTube](https://www.youtube.com/watch?v=VMLUGVumYkg)
 
 ## Requirements
 

@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [1.1.3] - 2026-11-28
+
+- fix(hikashop): migrate products_json before files, re-read accepted refunds
+- docs(plugins): add 6-language READMEs (EN/zh-CN/ru/es/de/tr) and YouTube walkthrough previews across all 25 Paymos-labs repos
+- fix: close bug batches 11-12 across SDKs, CMS plugins, workers, proxy, backup and admin
+- chore: bundle Paymos PHP SDK v1.13.0
+- chore: rebuild canonical CMS package
+
+- An update now adds the `products_json` column to the payment attempt table before Joomla copies the new files. When the database refuses the change, the update stops and the previous version keeps taking payments, instead of finishing with every new payment failing on the missing column.
+- An accepted refund whose first read after the request got a temporary 401, 403 or 404 no longer stays in review for good: the plugin keeps the unverified withdrawal ID (`RefundCandidateStoreInterface`), so **Check refund** reads it again and records the refund in HikaShop. `composer.json` now requires `paymos/php-sdk` `^1.12.0`, the first release with that interface.
+
 ## [1.1.2] - 2026-11-22
 
 - chore: rebuild canonical CMS package

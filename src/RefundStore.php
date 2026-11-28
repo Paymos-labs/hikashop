@@ -13,6 +13,7 @@ use Joomla\Database\DatabaseInterface;
 use Paymos\Plugin\AmountGuard;
 use Paymos\Plugin\EffectClaim;
 use Paymos\Plugin\NativeProjectionResult;
+use Paymos\Plugin\RefundCandidateStoreInterface;
 use Paymos\Plugin\RefundIntent;
 use Paymos\Plugin\RefundIntentPage;
 use Paymos\Plugin\RefundIntentStoreInterface;
@@ -22,7 +23,7 @@ use Paymos\Plugin\VerifiedRefund;
 
 defined('_JEXEC') or die;
 
-final class RefundStore implements RefundIntentStoreInterface
+final class RefundStore implements RefundIntentStoreInterface, RefundCandidateStoreInterface
 {
     private const TERMINAL = [RefundStates::COMPLETED, RefundStates::FAILED, RefundStates::CANCELLED];
 
@@ -262,6 +263,20 @@ final class RefundStore implements RefundIntentStoreInterface
                 throw new \RuntimeException('refund_projection_conflict');
             }
             $this->update($intent, ['projection' => $result->toArray()]);
+        });
+    }
+
+    /** Keep the unverified ID of an accepted POST so the next check reads it again; it never binds the refund. */
+    public function recordReadCandidate(string $operationId, ?string $candidateWithdrawalId, int $retryCount): void
+    {
+        if (($candidateWithdrawalId !== null && trim($candidateWithdrawalId) === '') || $retryCount < 0) {
+            throw new \InvalidArgumentException('refund_candidate_invalid');
+        }
+
+        $this->transaction(function () use ($operationId, $candidateWithdrawalId, $retryCount): void {
+            $this->update($this->getIntent($operationId), [
+                'candidate_withdrawal_id' => $candidateWithdrawalId, 'read_retry_count' => $retryCount,
+            ]);
         });
     }
 

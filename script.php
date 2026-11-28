@@ -64,6 +64,19 @@ final class PlgHikashoppaymentPaymosInstallerScript
             return $this->reject('Paymos for HikaShop could not verify the HikaShop installation and database tables.');
         }
 
+        // Joomla copies the new files before postflight and ignores its false result. Migrate here, so an
+        // update that cannot add the column is refused while the previous version still runs.
+        if ($type === 'update') {
+            try {
+                $migrated = self::ensureAttemptProductsColumn(Factory::getContainer()->get(DatabaseInterface::class));
+            } catch (Throwable) {
+                $migrated = false;
+            }
+            if (!$migrated) {
+                return $this->reject('Paymos for HikaShop could not update the payment attempt table.');
+            }
+        }
+
         return true;
     }
 
